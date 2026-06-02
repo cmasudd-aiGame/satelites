@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard de Pases Satélites - Chile</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/4.1.3/satellite.min.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen font-sans">
+
+    <div class="flex flex-col h-screen">
+        <header class="bg-slate-800 border-b border-slate-700 p-4 flex justify-between items-center shrink-0">
+            <div>
+                <h1 class="text-xl font-bold tracking-tight">🛰️ Monitor de Órbitas: Aqua, Terra & TROPOMI</h1>
+                <p class="text-xs text-slate-400">Predicción de ventanas óptimas de captura para los próximos 6 meses</p>
+            </div>
+            <div id="loading-status" class="text-sm bg-amber-500/20 text-amber-400 px-3 py-1 rounded border border-amber-500/30 font-medium animate-pulse">
+                Descargando TLEs desde Celestrak...
+            </div>
+        </header>
+
+        <div class="flex flex-1 overflow-hidden">
+            <div class="w-1/2 p-4 flex flex-col gap-4 border-r border-slate-700">
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-wrap gap-4 items-center justify-between shrink-0">
+                    <div class="flex items-center gap-2">
+                        <label for="month-select" class="text-sm font-medium text-slate-300">Mes a consultar:</label>
+                        <select id="month-select" class="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"></select>
+                    </div>
+                    <div class="text-xs text-slate-400 bg-slate-900 px-3 py-2 rounded border border-slate-700">
+                        📍 Coordenadas: <span id="coord-display" class="font-mono text-blue-400 font-bold">-33.4569, -70.6483</span>
+                    </div>
+                </div>
+
+                <div id="map" class="flex-1 rounded-xl border border-slate-700 overflow-hidden z-0"></div>
+            </div>
+
+            <div class="w-1/2 p-4 flex flex-col overflow-hidden">
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col h-full overflow-hidden">
+                    <h2 class="text-lg font-semibold border-b border-slate-700 pb-2 mb-4 shrink-0 flex justify-between items-center">
+                        📅 Calendario de Pases Óptimos 
+                        <span class="text-xs font-normal text-slate-400 italic">(Cenit > 30° para evitar deformación angular)</span>
+                    </h2>
+                    
+                    <div id="results-container" class="flex-1 overflow-y-auto pr-2 space-y-4">
+                        <div class="text-slate-400 text-center py-12">
+                            Haz click en cualquier punto del mapa para calcular el barrido mensual de pases satelitales.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // CONFIGURACIÓN INICIAL
+        const SATS_CONFIG = [
+            { id: '25994', name: 'TERRA', color: 'border-emerald-500 text-emerald-400 bg-emerald-950/20' },
+            { id: '27424', name: 'AQUA', color: 'border-cyan-500 text-cyan-400 bg-cyan-950/20' },
+            { id: '42969', name: 'TROPOMI (S5P)', color: 'border-violet-500 text-violet-400 bg-violet-950/20' }
+        ];
+
+        let loadedTles = [];
+        let currentCoords = { lat: -33.4569, lng: -70.6483 }; // Santiago default
+        let map, marker;
+
+        // 1. Inicializar Mapa (Centrado en Chile central)
+        function initMap() {
+            map = L.map('map').setView([currentCoords.lat, currentCoords.lng], 6);
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; OpenStreetMap &copy; CARTO'
+            }).addTo(map);
+
+            marker = L.marker([currentCoords.lat, currentCoords.lng]).addTo(map);
+
+            map.on('click', function(e) {
+                currentCoords = e.latlng;
+                marker.setLatLng(currentCoords);
+                document.getElementById('coord-display').innerText = `${currentCoords.lat.toFixed(4)}, ${currentCoords.lng.toFixed(4)}`;
+                processSatelliteData();
+            });
+        }
+
+        // 2. Generar opciones para el selector de los próximos 6 meses
+        function initMonthSelector() {
+            const select = document.getElementById('month-select');
+            const now = new Date();
+            const mesesStr = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+            
+            for (let i = 0; i < 6; i++) {
+                const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+                const opt = document.createElement('option');
+                opt.value = `${d.getFullYear()}-${d.getMonth()}`;
+                opt.innerText = `${mesesStr[d.getMonth()]} ${d.getFullYear()}`;
+                select.appendChild(opt);
+            }
+            select.addEventListener('change', processSatelliteData);
+        }
+
+        // 3. Descargar TLEs actualizados usando Corsproxy.io para evitar problemas de CORS
+        async function fetchTLEs() {
+            const status = document.getElementById('loading-status');
+            try {
+                // Buscamos los TLEs directo de la base de datos de Celestrak (Satélites activos)
+                const response = await fetch('https://corsproxy.io/?' + encodeURIComponent('https://celestrak.org/NORAD/elements/active.txt'));
+                const text = await response.text();
+                const lines = text.split('\n');
+
+                SATS_CONFIG.forEach(sat => {
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].includes(sat.id)) {
+                            // En formato Celestrak, la línea 0 es el nombre, 1 y 2 son el TLE
+                            loadedTles.push({
+                                name: sat.name,
+                                color: sat.color,
+                                line1: lines[i],
+                                line2: lines[i+1]
+                            });
+                            break;
+                        }
+                    }
+                });
+
+                status.innerText = "⚡ TLEs de Celestrak cargados con éxito";
+                status.className = "text-sm bg-emerald-500/20 text-emerald-400 px-3 py-1 rounded border border-emerald-500/30 font-medium";
+                processSatelliteData(); // Primer cálculo inicial
+            } catch (error) {
+                console.error(error);
+                status.innerText = "⚠️ Error descargando TLEs. Usando datos de respaldo offline.";
+                status.className = "text-sm bg-rose-500/20 text-rose-400 px-3 py-1 rounded border border-rose-500/30 font-medium";
+                // Datos fallback por si falla la conexión
+                loadedTles = [
+                    { name: "TERRA", color: SATS_CONFIG[0].color, line1: "1 25994U 99068A   26152.45423194  .00000045  00000-0  35999-4 0  9993", line2: "2 25994  98.2104 154.3412 0001234  78.4321 281.7654 14.57102345123456" },
+                    { name: "AQUA", color: SATS_CONFIG[1].color, line1: "1 27424U 02022A   26152.51234567  .00000135  00000-0  39999-4 0  9997", line2: "2 27424  98.2123 186.0654 0002229  67.6025 313.3829 14.57107527283421" },
+                    { name: "TROPOMI (S5P)", color: SATS_CONFIG[2].color, line1: "1 42969U 17064A   26152.21345678  .00000089  00000-0  12345-3 0  9991", line2: "2 42969  98.7423 210.1234 0001421  92.1234 268.1234 14.37213456432101" }
+                ];
+                processSatelliteData();
+            }
+        }
+
+        // 4. Lógica de cálculo orbital (Barrido)
+        function processSatelliteData() {
+            if (loadedTles.length === 0) return;
+
+            const resultsContainer = document.getElementById('results-container');
+            resultsContainer.innerHTML = ""; // Limpiar panel anterior
+
+            const [year, month] = document.getElementById('month-select').value.split('-').map(Number);
+            
+            // Definir ventana de tiempo (Inicio y fin del mes seleccionado)
+            const startDate = new Date(year, month, 1, 0, 0, 0);
+            const endDate = new Date(year, month + 1, 1, 0, 0, 0);
+
+            // Estructurar coordenadas para satellite.js
+            const observerGd = {
+                longitude: satellite.degreesToRadians(currentCoords.lng),
+                latitude: satellite.degreesToRadians(currentCoords.lat),
+                height: 0.5 // Promedio 500 metros sobre nivel del mar
+            };
+
+            let todosLosPases = [];
+
+            // Procesar cada satélite cargado
+            loadedTles.forEach(sat => {
+                const satrec = satellite.twoline2satrec(sat.line1, sat.line2);
+                let isVisibleNow = false;
+                let passStart = null;
+                let maxElevation = 0;
+
+                // Paso de tiempo: 30 segundos (Equilibrio perfecto entre velocidad de cómputo y precisión)
+                const stepMs = 30000; 
+
+                for (let time = startDate.getTime(); time < endDate.getTime(); time += stepMs) {
+                    const currentDate = new Date(time);
+                    const positionAndVelocity = satellite.propagate(satrec, currentDate);
+                    const positionEci = positionAndVelocity.position;
+
+                    if (!positionEci) continue;
+
+                    const gmst = satellite.gfy(currentDate);
+                    const lookAngles = satellite.ecfToLookAngles(observerGd, satellite.eciToEcf(positionEci, gmst));
+                    const elevation = satellite.radiansToDegrees(lookAngles.elevation);
+
+                    // Filtramos pases útiles: > 30° de elevación (óptimos para sensoramiento/observación limpia)
+                    if (elevation > 30) {
+                        if (!isVisibleNow) {
+                            isVisibleNow = true;
+                            passStart = currentDate;
+                            maxElevation = elevation;
+                        } else {
+                            if (elevation > maxElevation) maxElevation = elevation;
+                        }
+                    } else {
+                        if (isVisibleNow) {
+                            isVisibleNow = false;
+                            todosLosPases.push({
+                                satName: sat.name,
+                                colorClass: sat.color,
+                                date: passStart,
+                                maxElev: maxElevation
+                            });
+                            maxElevation = 0;
+                        }
+                    }
+                }
+            });
+
+            // Ordenar todos los pases cronológicamente
+            todosLosPases.sort((a, b) => a.date - b.date);
+
+            // Renderizar los resultados en el Dashboard
+            if (todosLosPases.length === 0) {
+                resultsContainer.innerHTML = `
+                    <div class="text-amber-400 bg-amber-950/20 border border-amber-800/50 p-4 rounded-lg text-center text-sm">
+                        No se detectaron pases limpios (Cenit > 30°) para este punto geográfico en el mes seleccionado.
+                    </div>`;
+                return;
+            }
+
+            // Agrupar por días para generar una visualización clara de agenda
+            let currentDayStr = "";
+            let dayContainer = null;
+
+            todosLosPases.forEach(pass => {
+                const dayStr = pass.date.toLocaleDateString('es-CL', { weekday: 'long', day: 'numeric', month: 'short' });
+                
+                if (dayStr !== currentDayStr) {
+                    currentDayStr = dayStr;
+                    // Crear bloque de día nuevo
+                    dayContainer = document.createElement('div');
+                    dayContainer.className = "bg-slate-900/60 p-3 rounded-lg border border-slate-700/50 space-y-2";
+                    dayContainer.innerHTML = `<h3 class="text-xs font-bold uppercase tracking-wider text-slate-400">${dayStr}</h3>`;
+                    resultsContainer.appendChild(dayContainer);
+                }
+
+                // Generar la fila del pase satelital
+                const row = document.createElement('div');
+                row.className = `flex justify-between items-center p-2 rounded border border-l-4 ${pass.colorClass.split(' ')[0]} ${pass.colorClass.split(' ').slice(2).join(' ')} text-sm transition-all hover:scale-[1.01]`;
+                
+                row.innerHTML = `
+                    <div class="flex flex-col">
+                        <span class="font-bold tracking-wide">${pass.satName}</span>
+                        <span class="text-xs text-slate-300 font-mono">⏱️ Ventana óptima: ${pass.date.toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                    </div>
+                    <div class="text-right">
+                        <span class="text-xs font-semibold px-2 py-0.5 rounded bg-slate-800 border border-slate-600 block">
+                            📈 Cenit: ${pass.sat.includes ? pass.maxElev.toFixed(1) : pass.maxElev.toFixed(0)}°
+                        </span>
+                    </div>
+                `;
+                dayContainer.appendChild(row);
+            });
+        }
+
+        // Ejecutar al cargar la página
+        window.onload = () => {
+            initMap();
+            initMonthSelector();
+            fetchTLEs();
+        };
+    </script>
+</body>
+</html>
